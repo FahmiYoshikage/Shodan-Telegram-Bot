@@ -15,12 +15,12 @@
 
 set -e
 
-# ─── Configuration (EDIT THESE) ─────────────────────────────
-RESOURCE_GROUP="rg-shodan-bot"
-LOCATION="southeastasia"          # Closest region (Singapore)
-STORAGE_ACCOUNT="stshodanbot$(date +%s | tail -c 6)"  # Must be globally unique
-FUNCTION_APP_NAME="func-shodan-telegram"  # Must be globally unique — CHANGE THIS
-PYTHON_VERSION="3.11"
+# ─── Configuration ──────────────────────────────────────────
+RESOURCE_GROUP="rg-fahmi-lab"
+LOCATION="southeastasia"
+STORAGE_ACCOUNT="stshodanbot$(date +%s | tail -c 6)"
+FUNCTION_APP_NAME="Shodan-TelegramBot"
+PYTHON_VERSION="3.12"
 
 # ─── Colors ─────────────────────────────────────────────────
 RED='\033[0;31m'
