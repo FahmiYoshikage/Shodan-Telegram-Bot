@@ -1,11 +1,19 @@
 """
 Configuration module for Shodan Telegram Bot.
+Works with both:
+  - .env file (local dev / polling mode)
+  - Azure Function App Settings (production / webhook mode)
 """
 
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env file if it exists (local dev); in Azure Functions, env vars
+# are set via Application Settings and this is a no-op.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not needed in Azure Functions — env vars set via App Settings
 
 # ─── Telegram ───────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")

@@ -1,937 +1,103 @@
 """
-Shodan Telegram Bot — Main entry point.
-Full-featured Shodan interface via Telegram with beautiful UX.
+Shodan Telegram Bot — Local development entry point (polling mode).
+For Azure Functions deployment, use function_app.py instead.
+
+Usage:
+    python bot.py          → Run in polling mode (local dev)
+    python bot.py --setup  → Set webhook URL (for Azure Functions)
+    python bot.py --remove → Remove webhook (switch back to polling)
 """
 
+import sys
+import asyncio
 import logging
-import html
-from functools import wraps
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.constants import ParseMode
+from telegram import Update
 
-from config import TELEGRAM_BOT_TOKEN, AUTHORIZED_USERS, EMOJI, LOG_LEVEL
-from shodan_client import shodan_client
-from formatter import (
-    format_search_results,
-    format_host_info,
-    format_dns_resolve,
-    format_dns_reverse,
-    format_domain_info,
-    format_exploits,
-    format_api_info,
-    format_scan_result,
-    format_scan_status,
-    format_honeypot_score,
-    format_welcome,
-    format_filters_help,
-    escape_html,
-    header_box,
-    key_value,
-    section_header,
-)
-from keyboards import (
-    main_menu_keyboard,
-    categories_keyboard,
-    templates_in_category_keyboard,
-    template_detail_keyboard,
-    pagination_keyboard,
-    back_to_main_keyboard,
-    dns_menu_keyboard,
-    confirm_scan_keyboard,
-)
-from templates import (
-    get_template_by_id,
-    get_templates_by_category,
-    search_templates,
-    build_query,
-    CATEGORIES,
-    SearchTemplate,
-)
+from config import TELEGRAM_BOT_TOKEN, SHODAN_API_KEY, LOG_LEVEL
+from bot_app import build_application
 
-# ─── Logging ────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger(__name__)
 
-# ─── Conversation states ────────────────────────────────────
-(
-    STATE_WAITING_PARAM,
-    STATE_WAITING_RAW_QUERY,
-    STATE_WAITING_HOST_IP,
-    STATE_WAITING_DNS,
-    STATE_WAITING_EXPLOIT,
-    STATE_WAITING_SCAN_IP,
-    STATE_WAITING_HONEYPOT_IP,
-    STATE_WAITING_COUNT_QUERY,
-) = range(8)
 
+async def setup_webhook(url: str):
+    """Register webhook with Telegram."""
+    from telegram import BotCommand
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  AUTH DECORATOR
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def authorized(func):
-    """Restrict access to authorized users only."""
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if AUTHORIZED_USERS and user_id not in AUTHORIZED_USERS:
-            msg = f"{EMOJI['error']} <b>Akses ditolak.</b>\nUser ID kamu: <code>{user_id}</code>\nHubungi admin untuk mendapatkan akses."
-            if update.callback_query:
-                await update.callback_query.answer("⛔ Akses ditolak", show_alert=True)
-            else:
-                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-            return ConversationHandler.END
-        return await func(update, context)
-    return wrapper
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  HELPER: SEND LONG MESSAGES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def send_messages(update: Update, context: ContextTypes.DEFAULT_TYPE, messages: list[str], reply_markup=None):
-    """Send multiple messages, attaching reply_markup to the last one."""
-    chat_id = update.effective_chat.id
-    for i, msg in enumerate(messages):
-        markup = reply_markup if i == len(messages) - 1 else None
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
-            # Try sending without HTML if parsing fails
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=msg[:4000],
-                    reply_markup=markup,
-                )
-            except Exception as e2:
-                logger.error(f"Error sending fallback message: {e2}")
-
-
-async def reply_html(update: Update, text: str, reply_markup=None):
-    """Reply with HTML parse mode."""
-    try:
-        if update.callback_query:
-            await update.callback_query.message.reply_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-        else:
-            await update.message.reply_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-    except Exception as e:
-        logger.error(f"HTML reply error: {e}")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  COMMAND HANDLERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@authorized
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
-    await reply_html(update, format_welcome(), main_menu_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
-    await reply_html(update, format_welcome(), main_menu_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_templates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /templates command — show categories."""
-    text = f"{header_box('Template Pencarian', 'Pilih kategori di bawah')}\n\n{EMOJI['info']} Pilih kategori untuk melihat template pencarian yang tersedia:"
-    await reply_html(update, text, categories_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /search [query] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['search']} <b>Pencarian Shodan</b>\n\nKirim query Shodan langsung.\n"
-            f"<i>Contoh: product:\"nginx\" country:\"ID\"</i>",
-            back_to_main_keyboard(),
+    app = build_application()
+    async with app:
+        result = await app.bot.set_webhook(
+            url=url,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
         )
-        context.user_data["awaiting"] = "raw_query"
-        return STATE_WAITING_RAW_QUERY
+        # Set bot commands
+        commands = [
+            BotCommand("start", "Mulai bot & tampilkan menu"),
+            BotCommand("templates", "Template pencarian siap pakai"),
+            BotCommand("t", "Shortcut untuk /templates"),
+            BotCommand("search", "Pencarian Shodan langsung"),
+            BotCommand("count", "Hitung hasil (hemat credits)"),
+            BotCommand("host", "Lookup detail IP"),
+            BotCommand("dns", "DNS resolve hostname"),
+            BotCommand("rdns", "Reverse DNS lookup"),
+            BotCommand("domain", "Info DNS domain"),
+            BotCommand("exploit", "Cari exploit"),
+            BotCommand("honeypot", "Cek honeypot score"),
+            BotCommand("scan", "Request scan IP"),
+            BotCommand("scanstatus", "Cek status scan"),
+            BotCommand("info", "Cek akun & credits"),
+            BotCommand("filters", "Referensi filter Shodan"),
+            BotCommand("help", "Tampilkan bantuan"),
+        ]
+        await app.bot.set_my_commands(commands)
+        print(f"✅ Webhook {'set' if result else 'FAILED'}: {url}")
+
+
+async def remove_webhook():
+    """Remove webhook from Telegram."""
+    app = build_application()
+    async with app:
+        result = await app.bot.delete_webhook(drop_pending_updates=True)
+        print(f"✅ Webhook {'removed' if result else 'FAILED'}")
 
-    query = " ".join(args)
-    await _execute_search(update, context, query, page=1)
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /count [query] — count without credits."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['stats']} <b>Count Query</b>\n\nKirim query untuk di-count (tanpa pakai query credits).\n"
-            f"<i>Contoh: country:\"ID\" port:22</i>",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "count_query"
-        return STATE_WAITING_COUNT_QUERY
-
-    query = " ".join(args)
-    await _execute_count(update, context, query)
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_host(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /host [IP] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['host']} <b>Host Lookup</b>\n\nKirim IP address untuk lookup.\n"
-            f"<i>Contoh: 8.8.8.8</i>",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "host_ip"
-        return STATE_WAITING_HOST_IP
-
-    ip = args[0]
-    await _execute_host(update, context, ip)
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_dns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /dns [hostname] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['dns']} <b>DNS Resolve</b>\n\nKirim hostname untuk resolve ke IP.\n"
-            f"<i>Contoh: google.com</i>",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "dns_resolve"
-        return STATE_WAITING_DNS
-
-    hostname = args[0]
-    data = shodan_client.dns_resolve([hostname])
-    await reply_html(update, format_dns_resolve(data), back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_rdns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /rdns [IP] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['dns']} <b>Reverse DNS</b>\n\nKirim IP untuk reverse DNS lookup.\n"
-            f"<i>Contoh: 8.8.8.8</i>",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "dns_reverse"
-        return STATE_WAITING_DNS
-
-    ip = args[0]
-    data = shodan_client.dns_reverse([ip])
-    await reply_html(update, format_dns_reverse(data), back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /domain [domain] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['globe']} <b>Domain Info</b>\n\nKirim domain untuk lihat DNS records.\n"
-            f"<i>Contoh: example.com</i>",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "dns_domain"
-        return STATE_WAITING_DNS
-
-    domain = args[0]
-    data = shodan_client.dns_domain(domain)
-    await reply_html(update, format_domain_info(data), back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_exploit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /exploit [query] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['exploit']} <b>Exploit Search</b>\n\nKirim keyword untuk cari exploit.\n"
-            f"<i>Contoh: apache 2.4</i>",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "exploit_query"
-        return STATE_WAITING_EXPLOIT
-
-    query = " ".join(args)
-    data = shodan_client.search_exploits(query)
-    msgs = format_exploits(data)
-    await send_messages(update, context, msgs, back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_honeypot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /honeypot [IP] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['honeypot']} <b>Honeypot Detection</b>\n\nKirim IP untuk cek honeypot score.\n"
-            f"<i>Contoh: 1.2.3.4</i>",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "honeypot_ip"
-        return STATE_WAITING_HONEYPOT_IP
-
-    ip = args[0]
-    score = shodan_client.honeypot_score(ip)
-    await reply_html(update, format_honeypot_score(ip, score), back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /scan [IP] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['ip']} <b>Request Scan</b>\n\nKirim IP/CIDR untuk request scan.\n"
-            f"<i>Contoh: 1.2.3.4</i>\n\n"
-            f"{EMOJI['warning']} <b>Perhatian:</b> Scan menggunakan scan credits!",
-            back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "scan_ip"
-        return STATE_WAITING_SCAN_IP
-
-    ip = args[0]
-    text = f"{EMOJI['warning']} <b>Konfirmasi Scan</b>\n\nApakah kamu yakin ingin scan <code>{escape_html(ip)}</code>?\nIni akan menggunakan scan credits."
-    await reply_html(update, text, confirm_scan_keyboard(ip))
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_scanstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /scanstatus [scan_id] command."""
-    args = context.args
-    if not args:
-        await reply_html(
-            update,
-            f"{EMOJI['info']} <b>Scan Status</b>\n\nKirim scan ID untuk cek status.\n"
-            f"<i>Contoh: /scanstatus abc123</i>",
-            back_to_main_keyboard(),
-        )
-        return ConversationHandler.END
-
-    scan_id = args[0]
-    data = shodan_client.scan_status(scan_id)
-    await reply_html(update, format_scan_status(data), back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /info command."""
-    info = shodan_client.api_info()
-    await reply_html(update, format_api_info(info), back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-@authorized
-async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /filters command."""
-    await reply_html(update, format_filters_help(), back_to_main_keyboard())
-    return ConversationHandler.END
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CALLBACK QUERY HANDLER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@authorized
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all inline keyboard callbacks."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    # ─── Navigation ─────────────────────────────────────────
-    if data == "menu:main":
-        await query.message.reply_text(
-            format_welcome(), parse_mode=ParseMode.HTML,
-            reply_markup=main_menu_keyboard(),
-            disable_web_page_preview=True,
-        )
-        return ConversationHandler.END
-
-    if data == "menu:templates":
-        text = f"{header_box('Template Pencarian', 'Pilih kategori')}\n\n{EMOJI['info']} Pilih kategori di bawah:"
-        await query.message.reply_text(
-            text, parse_mode=ParseMode.HTML, reply_markup=categories_keyboard(),
-        )
-        return ConversationHandler.END
-
-    if data == "menu:host":
-        await query.message.reply_text(
-            f"{EMOJI['host']} <b>Host Lookup</b>\n\nKirim IP address:\n<i>Contoh: 8.8.8.8</i>",
-            parse_mode=ParseMode.HTML, reply_markup=back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "host_ip"
-        return STATE_WAITING_HOST_IP
-
-    if data == "menu:dns":
-        await query.message.reply_text(
-            f"{EMOJI['dns']} <b>DNS Tools</b>\n\nPilih tool DNS:",
-            parse_mode=ParseMode.HTML, reply_markup=dns_menu_keyboard(),
-        )
-        return ConversationHandler.END
-
-    if data == "menu:exploits":
-        await query.message.reply_text(
-            f"{EMOJI['exploit']} <b>Exploit Search</b>\n\nKirim keyword:\n<i>Contoh: apache 2.4</i>",
-            parse_mode=ParseMode.HTML, reply_markup=back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "exploit_query"
-        return STATE_WAITING_EXPLOIT
-
-    if data == "menu:vuln":
-        vuln_templates = get_templates_by_category("vuln")
-        buttons = []
-        for t in vuln_templates:
-            buttons.append([InlineKeyboardButton(f"{t.emoji} {t.name}", callback_data=f"tmpl:{t.id}")])
-        buttons.append([InlineKeyboardButton("🔙 Kembali", callback_data="menu:main")])
-        await query.message.reply_text(
-            f"{EMOJI['vuln']} <b>Vulnerability Search</b>\n\nPilih template:",
-            parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return ConversationHandler.END
-
-    if data == "menu:raw":
-        await query.message.reply_text(
-            f"{EMOJI['gear']} <b>Raw Shodan Query</b>\n\n"
-            f"Kirim query Shodan langsung:\n"
-            f"<i>Contoh: product:\"nginx\" country:\"ID\" port:443</i>\n\n"
-            f"{EMOJI['info']} Gunakan /filters untuk lihat daftar filter.",
-            parse_mode=ParseMode.HTML, reply_markup=back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "raw_query"
-        return STATE_WAITING_RAW_QUERY
-
-    if data == "menu:count":
-        await query.message.reply_text(
-            f"{EMOJI['stats']} <b>Count Query</b>\n\n"
-            f"Kirim query untuk di-count (tanpa pakai credits):\n"
-            f"<i>Contoh: country:\"ID\" port:22</i>",
-            parse_mode=ParseMode.HTML, reply_markup=back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "count_query"
-        return STATE_WAITING_COUNT_QUERY
-
-    # ─── Commands via callback ──────────────────────────────
-    if data == "cmd:info":
-        info = shodan_client.api_info()
-        await query.message.reply_text(
-            format_api_info(info), parse_mode=ParseMode.HTML,
-            reply_markup=back_to_main_keyboard(),
-        )
-        return ConversationHandler.END
-
-    if data == "cmd:filters":
-        await query.message.reply_text(
-            format_filters_help(), parse_mode=ParseMode.HTML,
-            reply_markup=back_to_main_keyboard(),
-            disable_web_page_preview=True,
-        )
-        return ConversationHandler.END
-
-    if data == "cmd:help":
-        await query.message.reply_text(
-            format_welcome(), parse_mode=ParseMode.HTML,
-            reply_markup=main_menu_keyboard(),
-            disable_web_page_preview=True,
-        )
-        return ConversationHandler.END
-
-    # ─── Category selection ─────────────────────────────────
-    if data.startswith("cat:"):
-        cat_id = data[4:]
-        cat_info = CATEGORIES.get(cat_id, {"name": cat_id})
-        text = f"{EMOJI['search']} <b>{escape_html(cat_info['name'])}</b>\n\nPilih template:"
-        await query.message.reply_text(
-            text, parse_mode=ParseMode.HTML,
-            reply_markup=templates_in_category_keyboard(cat_id),
-        )
-        return ConversationHandler.END
-
-    # ─── Template detail ────────────────────────────────────
-    if data.startswith("tmpl:"):
-        tmpl_id = data[5:]
-        tmpl = get_template_by_id(tmpl_id)
-        if not tmpl:
-            await query.message.reply_text(f"{EMOJI['error']} Template tidak ditemukan.")
-            return ConversationHandler.END
-
-        text = format_template_detail(tmpl)
-        await query.message.reply_text(
-            text, parse_mode=ParseMode.HTML,
-            reply_markup=template_detail_keyboard(tmpl),
-        )
-        return ConversationHandler.END
-
-    # ─── Use template (start filling params) ────────────────
-    if data.startswith("use:"):
-        tmpl_id = data[4:]
-        tmpl = get_template_by_id(tmpl_id)
-        if not tmpl:
-            await query.message.reply_text(f"{EMOJI['error']} Template tidak ditemukan.")
-            return ConversationHandler.END
-
-        context.user_data["current_template"] = tmpl_id
-        context.user_data["template_values"] = {}
-        context.user_data["param_index"] = 0
-
-        return await _ask_next_param(update, context)
-
-    # ─── Run example query ──────────────────────────────────
-    if data.startswith("example:"):
-        tmpl_id = data[8:]
-        tmpl = get_template_by_id(tmpl_id)
-        if not tmpl:
-            await query.message.reply_text(f"{EMOJI['error']} Template tidak ditemukan.")
-            return ConversationHandler.END
-
-        await query.message.reply_text(
-            f"⏳ <i>Menjalankan: <code>{escape_html(tmpl.example)}</code></i>",
-            parse_mode=ParseMode.HTML,
-        )
-        await _execute_search(update, context, tmpl.example, page=1, facets=tmpl.facets)
-        return ConversationHandler.END
-
-    # ─── Pagination ─────────────────────────────────────────
-    if data.startswith("page:"):
-        parts = data.split(":", 2)
-        if len(parts) == 3:
-            page = int(parts[1])
-            search_query = parts[2]
-            await _execute_search(update, context, search_query, page=page)
-        return ConversationHandler.END
-
-    # ─── DNS callbacks ──────────────────────────────────────
-    if data == "dns:resolve":
-        await query.message.reply_text(
-            f"{EMOJI['dns']} <b>DNS Resolve</b>\n\nKirim hostname:\n<i>Contoh: google.com</i>",
-            parse_mode=ParseMode.HTML, reply_markup=back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "dns_resolve"
-        return STATE_WAITING_DNS
-
-    if data == "dns:reverse":
-        await query.message.reply_text(
-            f"{EMOJI['dns']} <b>Reverse DNS</b>\n\nKirim IP address:\n<i>Contoh: 8.8.8.8</i>",
-            parse_mode=ParseMode.HTML, reply_markup=back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "dns_reverse"
-        return STATE_WAITING_DNS
-
-    if data == "dns:domain":
-        await query.message.reply_text(
-            f"{EMOJI['globe']} <b>Domain Info</b>\n\nKirim domain:\n<i>Contoh: example.com</i>",
-            parse_mode=ParseMode.HTML, reply_markup=back_to_main_keyboard(),
-        )
-        context.user_data["awaiting"] = "dns_domain"
-        return STATE_WAITING_DNS
-
-    # ─── Scan confirm ───────────────────────────────────────
-    if data.startswith("doscan:"):
-        ip = data[7:]
-        result = shodan_client.scan_ip(ip)
-        await query.message.reply_text(
-            format_scan_result(result), parse_mode=ParseMode.HTML,
-            reply_markup=back_to_main_keyboard(),
-        )
-        return ConversationHandler.END
-
-    # ─── Noop ───────────────────────────────────────────────
-    if data == "noop":
-        return ConversationHandler.END
-
-    return ConversationHandler.END
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TEMPLATE PARAMETER FLOW
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def _ask_next_param(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ask user for the next template parameter."""
-    tmpl_id = context.user_data.get("current_template")
-    tmpl = get_template_by_id(tmpl_id)
-    if not tmpl:
-        return ConversationHandler.END
-
-    idx = context.user_data.get("param_index", 0)
-    values = context.user_data.get("template_values", {})
-
-    if idx >= len(tmpl.params):
-        # All params collected — build and execute query
-        query = build_query(tmpl, values)
-        msg_target = update.callback_query.message if update.callback_query else update.message
-        await msg_target.reply_text(
-            f"⏳ <i>Menjalankan: <code>{escape_html(query)}</code></i>",
-            parse_mode=ParseMode.HTML,
-        )
-        await _execute_search(update, context, query, page=1, facets=tmpl.facets)
-        # Clean up
-        context.user_data.pop("current_template", None)
-        context.user_data.pop("template_values", None)
-        context.user_data.pop("param_index", None)
-        return ConversationHandler.END
-
-    param = tmpl.params[idx]
-
-    # Build progress indicator
-    progress_parts = []
-    for i, p in enumerate(tmpl.params):
-        if i < idx:
-            val = values.get(p.name, "?")
-            progress_parts.append(f"  {EMOJI['success']} <b>{p.name}:</b> <code>{escape_html(val)}</code>")
-        elif i == idx:
-            progress_parts.append(f"  {EMOJI['right']} <b>{p.name}:</b> <i>(menunggu input...)</i>")
-        else:
-            progress_parts.append(f"  {EMOJI['dot']} <b>{p.name}:</b> <i>-</i>")
-
-    progress = "\n".join(progress_parts)
-
-    text = (
-        f"{EMOJI['gear']} <b>Template: {escape_html(tmpl.name)}</b>\n"
-        f"{'─' * 28}\n"
-        f"\n<b>Progress:</b>\n{progress}\n\n"
-        f"{'─' * 28}\n"
-        f"{EMOJI['right']} <b>Masukkan {escape_html(param.description)}:</b>\n"
-        f"<i>Contoh: <code>{escape_html(param.placeholder)}</code></i>"
-    )
-
-    msg_target = update.callback_query.message if update.callback_query else update.message
-    await msg_target.reply_text(
-        text, parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"💡 Pakai default: {param.placeholder}", callback_data=f"default:{param.name}:{param.placeholder}")],
-            [InlineKeyboardButton("❌ Batal", callback_data="menu:main")],
-        ]),
-    )
-    context.user_data["awaiting"] = "template_param"
-    return STATE_WAITING_PARAM
-
-
-@authorized
-async def handle_param_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle parameter text input from user."""
-    awaiting = context.user_data.get("awaiting", "")
-
-    if awaiting == "template_param":
-        value = update.message.text.strip()
-        tmpl_id = context.user_data.get("current_template")
-        tmpl = get_template_by_id(tmpl_id)
-        if not tmpl:
-            return ConversationHandler.END
-
-        idx = context.user_data.get("param_index", 0)
-        param = tmpl.params[idx]
-        context.user_data["template_values"][param.name] = value
-        context.user_data["param_index"] = idx + 1
-
-        return await _ask_next_param(update, context)
-
-    elif awaiting == "raw_query":
-        query = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        await update.message.reply_text(
-            f"⏳ <i>Mencari: <code>{escape_html(query)}</code></i>",
-            parse_mode=ParseMode.HTML,
-        )
-        await _execute_search(update, context, query, page=1)
-        return ConversationHandler.END
-
-    elif awaiting == "count_query":
-        query = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        await _execute_count(update, context, query)
-        return ConversationHandler.END
-
-    elif awaiting == "host_ip":
-        ip = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        await _execute_host(update, context, ip)
-        return ConversationHandler.END
-
-    elif awaiting == "dns_resolve":
-        hostname = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        data = shodan_client.dns_resolve([hostname])
-        await reply_html(update, format_dns_resolve(data), back_to_main_keyboard())
-        return ConversationHandler.END
-
-    elif awaiting == "dns_reverse":
-        ip = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        data = shodan_client.dns_reverse([ip])
-        await reply_html(update, format_dns_reverse(data), back_to_main_keyboard())
-        return ConversationHandler.END
-
-    elif awaiting == "dns_domain":
-        domain = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        data = shodan_client.dns_domain(domain)
-        await reply_html(update, format_domain_info(data), back_to_main_keyboard())
-        return ConversationHandler.END
-
-    elif awaiting == "exploit_query":
-        query = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        data = shodan_client.search_exploits(query)
-        msgs = format_exploits(data)
-        await send_messages(update, context, msgs, back_to_main_keyboard())
-        return ConversationHandler.END
-
-    elif awaiting == "honeypot_ip":
-        ip = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        score = shodan_client.honeypot_score(ip)
-        await reply_html(update, format_honeypot_score(ip, score), back_to_main_keyboard())
-        return ConversationHandler.END
-
-    elif awaiting == "scan_ip":
-        ip = update.message.text.strip()
-        context.user_data.pop("awaiting", None)
-        text = f"{EMOJI['warning']} <b>Konfirmasi Scan</b>\n\nScan <code>{escape_html(ip)}</code>?\nIni menggunakan scan credits."
-        await reply_html(update, text, confirm_scan_keyboard(ip))
-        return ConversationHandler.END
-
-    # Default: treat as raw search
-    query = update.message.text.strip()
-    if query.startswith("/"):
-        return ConversationHandler.END
-    await _execute_search(update, context, query, page=1)
-    return ConversationHandler.END
-
-
-@authorized
-async def handle_default_param(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle default parameter button press."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data.startswith("default:"):
-        parts = data.split(":", 2)
-        if len(parts) == 3:
-            param_name = parts[1]
-            param_value = parts[2]
-
-            tmpl_id = context.user_data.get("current_template")
-            tmpl = get_template_by_id(tmpl_id)
-            if not tmpl:
-                return ConversationHandler.END
-
-            context.user_data["template_values"][param_name] = param_value
-            idx = context.user_data.get("param_index", 0)
-            context.user_data["param_index"] = idx + 1
-
-            return await _ask_next_param(update, context)
-
-    return ConversationHandler.END
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EXECUTION HELPERS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-async def _execute_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, page: int = 1, facets: str = ""):
-    """Execute a Shodan search and send formatted results."""
-    data = shodan_client.search(query, page=page, facets=facets)
-    messages = format_search_results(data, page)
-    total = data.get("total", 0)
-    markup = pagination_keyboard(query, page, total) if total > 0 else back_to_main_keyboard()
-    await send_messages(update, context, messages, markup)
-
-
-async def _execute_count(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """Execute a count query."""
-    data = shodan_client.search_count(query, facets="org:10,port:10,country:10")
-
-    if "error" in data:
-        await reply_html(update, f"{EMOJI['error']} <b>Error:</b> {escape_html(data['error'])}", back_to_main_keyboard())
-        return
-
-    from formatter import format_facets, format_number
-    total = data.get("total", 0)
-    facets_data = data.get("facets", {})
-
-    text = header_box("Count Result", f"Query: {query}")
-    text += f"\n\n{EMOJI['stats']} <b>Total:</b> {format_number(total)} hasil ditemukan"
-    text += f"\n{EMOJI['info']} <i>Count tidak menggunakan query credits!</i>"
-
-    if facets_data:
-        text += format_facets(facets_data)
-
-    await reply_html(update, text, back_to_main_keyboard())
-
-
-async def _execute_host(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
-    """Execute a host lookup and send results."""
-    await reply_html(update, f"⏳ <i>Looking up <code>{escape_html(ip)}</code>...</i>")
-    data = shodan_client.host_info(ip)
-    messages = format_host_info(data)
-    await send_messages(update, context, messages, back_to_main_keyboard())
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TEMPLATE DETAIL FORMATTER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def format_template_detail(tmpl: SearchTemplate) -> str:
-    """Format template details for display."""
-    params_text = ""
-    for p in tmpl.params:
-        req = "wajib" if p.required else "opsional"
-        params_text += f"  {EMOJI['right']} <b>{escape_html(p.name)}</b> — {escape_html(p.description)} ({req})\n"
-        params_text += f"     <i>Contoh: <code>{escape_html(p.placeholder)}</code></i>\n"
-
-    return (
-        f"{tmpl.emoji} <b>{escape_html(tmpl.name)}</b>\n"
-        f"{'─' * 28}\n\n"
-        f"{EMOJI['info']} {escape_html(tmpl.description)}\n\n"
-        f"{EMOJI['gear']} <b>Parameter:</b>\n{params_text}\n"
-        f"{EMOJI['search']} <b>Query template:</b>\n"
-        f"  <code>{escape_html(tmpl.query_template)}</code>\n\n"
-        f"{EMOJI['star']} <b>Contoh query:</b>\n"
-        f"  <code>{escape_html(tmpl.example)}</code>"
-    )
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  MAIN
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def main():
-    """Start the bot."""
+    """Main entry point."""
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not set! Copy .env.example to .env and fill in your tokens.")
+        logger.error(
+            "❌ TELEGRAM_BOT_TOKEN not set! "
+            "Copy .env.example to .env and fill in your tokens."
+        )
         return
     if not SHODAN_API_KEY:
-        logger.error("SHODAN_API_KEY not set! Copy .env.example to .env and fill in your tokens.")
+        logger.error(
+            "❌ SHODAN_API_KEY not set! "
+            "Copy .env.example to .env and fill in your tokens."
+        )
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Handle CLI arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--setup" and len(sys.argv) > 2:
+            asyncio.run(setup_webhook(sys.argv[2]))
+            return
+        elif sys.argv[1] == "--remove":
+            asyncio.run(remove_webhook())
+            return
+        elif sys.argv[1] == "--help":
+            print(__doc__)
+            return
 
-    # Conversation handler for template parameter flow and text inputs
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", cmd_start),
-            CommandHandler("help", cmd_help),
-            CommandHandler("templates", cmd_templates),
-            CommandHandler("t", cmd_templates),
-            CommandHandler("search", cmd_search),
-            CommandHandler("count", cmd_count),
-            CommandHandler("host", cmd_host),
-            CommandHandler("dns", cmd_dns),
-            CommandHandler("rdns", cmd_rdns),
-            CommandHandler("domain", cmd_domain),
-            CommandHandler("exploit", cmd_exploit),
-            CommandHandler("honeypot", cmd_honeypot),
-            CommandHandler("scan", cmd_scan),
-            CommandHandler("scanstatus", cmd_scanstatus),
-            CommandHandler("info", cmd_info),
-            CommandHandler("filters", cmd_filters),
-            CallbackQueryHandler(callback_handler),
-        ],
-        states={
-            STATE_WAITING_PARAM: [
-                CallbackQueryHandler(handle_default_param, pattern=r"^default:"),
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-            STATE_WAITING_RAW_QUERY: [
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-            STATE_WAITING_HOST_IP: [
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-            STATE_WAITING_DNS: [
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-            STATE_WAITING_EXPLOIT: [
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-            STATE_WAITING_SCAN_IP: [
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-            STATE_WAITING_HONEYPOT_IP: [
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-            STATE_WAITING_COUNT_QUERY: [
-                CallbackQueryHandler(callback_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("start", cmd_start),
-            CommandHandler("help", cmd_help),
-            CallbackQueryHandler(callback_handler),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_param_input),
-        ],
-        allow_reentry=True,
-    )
+    # Default: polling mode for local development
+    logger.info("🚀 Starting Shodan Telegram Bot (polling mode)...")
+    logger.info("   For Azure Functions, deploy with function_app.py")
 
-    app.add_handler(conv_handler)
-
-    logger.info("🚀 Shodan Telegram Bot starting...")
+    app = build_application()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
