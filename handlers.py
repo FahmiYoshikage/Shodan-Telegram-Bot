@@ -4,6 +4,8 @@ Extracted from bot.py so it can be shared between polling (bot.py) and webhook (
 """
 
 import logging
+import asyncio
+import traceback
 from functools import wraps
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -352,8 +354,16 @@ async def cmd_scanstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @authorized
 async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    info = shodan_client.api_info()
-    await reply_html(update, format_api_info(info), back_to_main_keyboard())
+    try:
+        info = await asyncio.to_thread(shodan_client.api_info)
+        await reply_html(update, format_api_info(info), back_to_main_keyboard())
+    except Exception as e:
+        logger.error(f"Info error: {e}")
+        await reply_html(
+            update,
+            f"{EMOJI['error']} <b>Error:</b> {escape_html(str(e))}",
+            back_to_main_keyboard(),
+        )
     return ConversationHandler.END
 
 
@@ -457,12 +467,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ─── Commands via callback ──────────────────────────────
     if data == "cmd:info":
-        info = shodan_client.api_info()
-        await query.message.reply_text(
-            format_api_info(info),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_to_main_keyboard(),
-        )
+        try:
+            info = await asyncio.to_thread(shodan_client.api_info)
+            await query.message.reply_text(
+                format_api_info(info),
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_to_main_keyboard(),
+            )
+        except Exception as e:
+            logger.error(f"Info callback error: {e}")
+            await query.message.reply_text(
+                f"{EMOJI['error']} <b>Error:</b> {escape_html(str(e))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_to_main_keyboard(),
+            )
         return ConversationHandler.END
 
     if data == "cmd:filters":
@@ -575,12 +593,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ─── Scan confirm ───────────────────────────────────────
     if data.startswith("doscan:"):
         ip = data[7:]
-        result = shodan_client.scan_ip(ip)
-        await query.message.reply_text(
-            format_scan_result(result),
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_to_main_keyboard(),
-        )
+        try:
+            result = await asyncio.to_thread(shodan_client.scan_ip, ip)
+            await query.message.reply_text(
+                format_scan_result(result),
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_to_main_keyboard(),
+            )
+        except Exception as e:
+            logger.error(f"Scan callback error: {e}")
+            await query.message.reply_text(
+                f"{EMOJI['error']} <b>Error saat scan:</b> {escape_html(str(e))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_to_main_keyboard(),
+            )
         return ConversationHandler.END
 
     if data == "noop":
@@ -699,36 +725,56 @@ async def handle_param_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif awaiting == "dns_resolve":
         hostname = update.message.text.strip()
         context.user_data.pop("awaiting", None)
-        data = shodan_client.dns_resolve([hostname])
-        await reply_html(update, format_dns_resolve(data), back_to_main_keyboard())
+        try:
+            data = await asyncio.to_thread(shodan_client.dns_resolve, [hostname])
+            await reply_html(update, format_dns_resolve(data), back_to_main_keyboard())
+        except Exception as e:
+            logger.error(f"DNS resolve error: {e}")
+            await reply_html(update, f"{EMOJI['error']} <b>Error:</b> {escape_html(str(e))}", back_to_main_keyboard())
         return ConversationHandler.END
 
     elif awaiting == "dns_reverse":
         ip = update.message.text.strip()
         context.user_data.pop("awaiting", None)
-        data = shodan_client.dns_reverse([ip])
-        await reply_html(update, format_dns_reverse(data), back_to_main_keyboard())
+        try:
+            data = await asyncio.to_thread(shodan_client.dns_reverse, [ip])
+            await reply_html(update, format_dns_reverse(data), back_to_main_keyboard())
+        except Exception as e:
+            logger.error(f"DNS reverse error: {e}")
+            await reply_html(update, f"{EMOJI['error']} <b>Error:</b> {escape_html(str(e))}", back_to_main_keyboard())
         return ConversationHandler.END
 
     elif awaiting == "dns_domain":
         domain = update.message.text.strip()
         context.user_data.pop("awaiting", None)
-        data = shodan_client.dns_domain(domain)
-        await reply_html(update, format_domain_info(data), back_to_main_keyboard())
+        try:
+            data = await asyncio.to_thread(shodan_client.dns_domain, domain)
+            await reply_html(update, format_domain_info(data), back_to_main_keyboard())
+        except Exception as e:
+            logger.error(f"DNS domain error: {e}")
+            await reply_html(update, f"{EMOJI['error']} <b>Error:</b> {escape_html(str(e))}", back_to_main_keyboard())
         return ConversationHandler.END
 
     elif awaiting == "exploit_query":
         query = update.message.text.strip()
         context.user_data.pop("awaiting", None)
-        data = shodan_client.search_exploits(query)
-        await send_messages(update, context, format_exploits(data), back_to_main_keyboard())
+        try:
+            data = await asyncio.to_thread(shodan_client.search_exploits, query)
+            await send_messages(update, context, format_exploits(data), back_to_main_keyboard())
+        except Exception as e:
+            logger.error(f"Exploit search error: {e}")
+            await reply_html(update, f"{EMOJI['error']} <b>Error:</b> {escape_html(str(e))}", back_to_main_keyboard())
         return ConversationHandler.END
 
     elif awaiting == "honeypot_ip":
         ip = update.message.text.strip()
         context.user_data.pop("awaiting", None)
-        score = shodan_client.honeypot_score(ip)
-        await reply_html(update, format_honeypot_score(ip, score), back_to_main_keyboard())
+        try:
+            score = await asyncio.to_thread(shodan_client.honeypot_score, ip)
+            await reply_html(update, format_honeypot_score(ip, score), back_to_main_keyboard())
+        except Exception as e:
+            logger.error(f"Honeypot score error: {e}")
+            await reply_html(update, f"{EMOJI['error']} <b>Error:</b> {escape_html(str(e))}", back_to_main_keyboard())
         return ConversationHandler.END
 
     elif awaiting == "scan_ip":
@@ -784,37 +830,75 @@ async def _execute_search(
     page: int = 1,
     facets: str = "",
 ):
-    data = shodan_client.search(query, page=page, facets=facets)
-    messages = format_search_results(data, page)
-    total = data.get("total", 0)
-    markup = pagination_keyboard(query, page, total) if total > 0 else back_to_main_keyboard()
-    await send_messages(update, context, messages, markup)
+    try:
+        data = await asyncio.to_thread(shodan_client.search, query, page=page, facets=facets)
+        if "error" in data:
+            await reply_html(
+                update,
+                f"{EMOJI['error']} <b>Error:</b> {escape_html(data['error'])}",
+                back_to_main_keyboard(),
+            )
+            return
+        messages = format_search_results(data, page)
+        total = data.get("total", 0)
+        markup = pagination_keyboard(query, page, total) if total > 0 else back_to_main_keyboard()
+        await send_messages(update, context, messages, markup)
+    except Exception as e:
+        logger.error(f"Search execution error: {e}\n{traceback.format_exc()}")
+        await reply_html(
+            update,
+            f"{EMOJI['error']} <b>Error saat pencarian:</b>\n<code>{escape_html(str(e))}</code>",
+            back_to_main_keyboard(),
+        )
 
 
 async def _execute_count(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    data = shodan_client.search_count(query, facets="org:10,port:10,country:10")
-    if "error" in data:
+    try:
+        data = await asyncio.to_thread(shodan_client.search_count, query, facets="org:10,port:10,country:10")
+        if "error" in data:
+            await reply_html(
+                update,
+                f"{EMOJI['error']} <b>Error:</b> {escape_html(data['error'])}",
+                back_to_main_keyboard(),
+            )
+            return
+        total = data.get("total", 0)
+        facets_data = data.get("facets", {})
+        text = header_box("Count Result", f"Query: {query}")
+        text += f"\n\n{EMOJI['stats']} <b>Total:</b> {format_number(total)} hasil ditemukan"
+        text += f"\n{EMOJI['info']} <i>Count tidak menggunakan query credits!</i>"
+        if facets_data:
+            text += format_facets(facets_data)
+        await reply_html(update, text, back_to_main_keyboard())
+    except Exception as e:
+        logger.error(f"Count execution error: {e}\n{traceback.format_exc()}")
         await reply_html(
             update,
-            f"{EMOJI['error']} <b>Error:</b> {escape_html(data['error'])}",
+            f"{EMOJI['error']} <b>Error saat count:</b>\n<code>{escape_html(str(e))}</code>",
             back_to_main_keyboard(),
         )
-        return
-    total = data.get("total", 0)
-    facets_data = data.get("facets", {})
-    text = header_box("Count Result", f"Query: {query}")
-    text += f"\n\n{EMOJI['stats']} <b>Total:</b> {format_number(total)} hasil ditemukan"
-    text += f"\n{EMOJI['info']} <i>Count tidak menggunakan query credits!</i>"
-    if facets_data:
-        text += format_facets(facets_data)
-    await reply_html(update, text, back_to_main_keyboard())
 
 
 async def _execute_host(update: Update, context: ContextTypes.DEFAULT_TYPE, ip: str):
-    await reply_html(update, f"⏳ <i>Looking up <code>{escape_html(ip)}</code>...</i>")
-    data = shodan_client.host_info(ip)
-    messages = format_host_info(data)
-    await send_messages(update, context, messages, back_to_main_keyboard())
+    try:
+        await reply_html(update, f"⏳ <i>Looking up <code>{escape_html(ip)}</code>...</i>")
+        data = await asyncio.to_thread(shodan_client.host_info, ip)
+        if "error" in data:
+            await reply_html(
+                update,
+                f"{EMOJI['error']} <b>Error:</b> {escape_html(data['error'])}",
+                back_to_main_keyboard(),
+            )
+            return
+        messages = format_host_info(data)
+        await send_messages(update, context, messages, back_to_main_keyboard())
+    except Exception as e:
+        logger.error(f"Host lookup error: {e}\n{traceback.format_exc()}")
+        await reply_html(
+            update,
+            f"{EMOJI['error']} <b>Error saat host lookup:</b>\n<code>{escape_html(str(e))}</code>",
+            back_to_main_keyboard(),
+        )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -840,3 +924,30 @@ def format_template_detail(tmpl: SearchTemplate) -> str:
         f"{EMOJI['star']} <b>Contoh query:</b>\n"
         f"  <code>{escape_html(tmpl.example)}</code>"
     )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  GLOBAL ERROR HANDLER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler — catches any unhandled exception and notifies the user."""
+    logger.error(f"Unhandled exception: {context.error}\n{traceback.format_exc()}")
+
+    if not isinstance(update, Update) or not update.effective_chat:
+        return
+
+    try:
+        error_msg = str(context.error) if context.error else "Unknown error"
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"{EMOJI['error']} <b>Terjadi error:</b>\n"
+                f"<code>{escape_html(error_msg[:500])}</code>\n\n"
+                f"<i>Silakan coba lagi atau gunakan /start</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_to_main_keyboard(),
+        )
+    except Exception as e:
+        logger.error(f"Error in error_handler: {e}")

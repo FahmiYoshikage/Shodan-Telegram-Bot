@@ -39,6 +39,7 @@ def _build_application() -> Application:
         cmd_host, cmd_dns, cmd_rdns, cmd_domain, cmd_exploit,
         cmd_honeypot, cmd_scan, cmd_scanstatus, cmd_info, cmd_filters,
         callback_handler, handle_param_input, handle_default_param,
+        error_handler,
         STATE_WAITING_PARAM, STATE_WAITING_RAW_QUERY, STATE_WAITING_HOST_IP,
         STATE_WAITING_DNS, STATE_WAITING_EXPLOIT, STATE_WAITING_SCAN_IP,
         STATE_WAITING_HONEYPOT_IP, STATE_WAITING_COUNT_QUERY,
@@ -116,6 +117,7 @@ def _build_application() -> Application:
     )
 
     app.add_handler(conv_handler)
+    app.add_error_handler(error_handler)
     return app
 
 
